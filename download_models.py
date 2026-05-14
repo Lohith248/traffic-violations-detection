@@ -8,6 +8,7 @@ import tarfile
 import tempfile
 import urllib.parse
 import urllib.request
+import zipfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -53,6 +54,21 @@ CLASS_ALIASES = {
         "licenseplate",
     },
 }
+
+
+def verify_roboflow_api_key(api_key: str) -> None:
+    """Verifies that the API key is valid and not a placeholder."""
+    if not api_key or len(api_key) < 10 or api_key.startswith("YOUR_"):
+        raise ValueError(
+            f"Invalid ROBOFLOW_API_KEY: '{api_key}'. "
+            "Please export a valid key from your Roboflow dashboard."
+        )
+
+    try:
+        url = f"https://api.roboflow.com/?api_key={urllib.parse.quote(api_key)}"
+        api_get_json(url)
+    except Exception as e:
+        raise RuntimeError(f"Could not verify Roboflow API key. Check your internet and key: {e}")
 
 
 def ensure_dir(path: Path) -> None:
@@ -388,33 +404,116 @@ def get_latest_version_number(project_obj: Any) -> int:
     return max(version_numbers)
 
 
+def _attempt_download(version_obj: Any, local_dir: Path) -> Optional[Path]:
+    """
+    Attempts to download a Roboflow dataset version in YOLOv8 format.
+    Returns the dataset path on success, or None if the export doesn't exist
+    on Roboflow's cloud storage (NoSuchKey / BadZipFile).
+    Raises for all other unexpected errors.
+    """
+    # Clean up any prior incomplete attempt for this exact version dir
+    shutil.rmtree(local_dir, ignore_errors=True)
+
+    try:
+        dataset = version_obj.download("yolov8", location=str(local_dir), overwrite=True)
+        # Verify a data.yaml was actually produced
+        result_path = Path(dataset.location)
+        if not (result_path / "data.yaml").exists():
+            shutil.rmtree(local_dir, ignore_errors=True)
+            return None
+        return result_path
+    except (zipfile.BadZipFile, Exception) as e:
+        # Peek at the "zip" to detect a NoSuchKey cloud error
+        no_such_key = False
+        zip_path = local_dir / "roboflow.zip"
+        if zip_path.exists():
+            try:
+                with zip_path.open("rb") as f:
+                    chunk = f.read(500)
+                decoded = chunk.decode("utf-8", errors="ignore")
+                if "NoSuchKey" in decoded or "does not exist" in decoded.lower():
+                    no_such_key = True
+            except Exception:
+                pass
+
+        shutil.rmtree(local_dir, ignore_errors=True)
+
+        if no_such_key:
+            # Caller will try the next version
+            return None
+
+        # Re-raise genuine errors (auth, network, etc.)
+        raise
+
+
 def download_roboflow_datasets(api_key: str, output_raw_dir: Path) -> List[Path]:
     rf = Roboflow(api_key=api_key)
     ensure_dir(output_raw_dir)
     workspace_hints = get_accessible_workspaces(api_key)
     downloaded_roots: List[Path] = []
+    skipped: List[str] = []
 
     for dataset_id in DATASET_IDENTIFIERS:
         workspace, project, explicit_version = parse_dataset_identifier(dataset_id, api_key, workspace_hints)
         project_obj = rf.workspace(workspace).project(project)
-        version = explicit_version if explicit_version is not None else get_latest_version_number(project_obj)
-        version_obj = project_obj.version(version)
 
-        local_name = f"{workspace}__{project}__v{version}"
-        local_dir = output_raw_dir / local_name
-        print(f"[INFO] Downloading Roboflow dataset: {dataset_id} -> {workspace}/{project} (v{version})")
+        # Build the list of versions to try
+        if explicit_version is not None:
+            versions_to_try = [explicit_version]
+        else:
+            all_versions = sorted(
+                [
+                    int(str(item.get("id", "")).split("/")[-1])
+                    for item in project_obj.get_version_information()
+                    if str(item.get("id", "")).split("/")[-1].isdigit()
+                ],
+                reverse=True,  # newest first
+            )
+            versions_to_try = all_versions if all_versions else []
 
-        dataset = version_obj.download("yolov8", location=str(local_dir), overwrite=False)
-        downloaded_roots.append(Path(dataset.location))
-        print(f"[OK] Saved dataset to {dataset.location}")
+        if not versions_to_try:
+            print(f"[WARN] No versions found for {dataset_id} — skipping.")
+            skipped.append(dataset_id)
+            continue
+
+        dataset_root = None
+        for version in versions_to_try:
+            local_name = f"{workspace}__{project}__v{version}"
+            local_dir = output_raw_dir / local_name
+
+            # Already successfully downloaded
+            if (local_dir / "data.yaml").exists():
+                print(f"[SKIP] Dataset already exists at {local_dir}")
+                dataset_root = local_dir
+                break
+
+            print(f"[INFO] Downloading Roboflow dataset: {dataset_id} -> {workspace}/{project} (v{version})")
+            result = _attempt_download(project_obj.version(version), local_dir)
+            if result is not None:
+                print(f"[OK] Saved dataset to {result}")
+                dataset_root = result
+                break
+            else:
+                print(f"[WARN] v{version} of {dataset_id} has no YOLOv8 export — trying older version...")
+
+        if dataset_root is not None:
+            downloaded_roots.append(dataset_root)
+        else:
+            print(f"[WARN] Could not download any version of {dataset_id} — skipping.")
+            skipped.append(dataset_id)
+
+    if skipped:
+        print(f"\n[WARN] {len(skipped)} dataset(s) were skipped: {skipped}")
+
+    if not downloaded_roots:
+        raise RuntimeError("No datasets were downloaded successfully. Cannot proceed with merging.")
 
     return downloaded_roots
 
 
 def main() -> None:
     api_key = os.getenv("ROBOFLOW_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError("Environment variable ROBOFLOW_API_KEY is required.")
+    verify_roboflow_api_key(api_key)
 
     print("[STEP] Downloading YOLOv8s base weights...")
     download_yolov8_base_weights(MODEL_DIR)
