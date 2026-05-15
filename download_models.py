@@ -13,8 +13,12 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
-from roboflow import Roboflow
 from ultralytics import YOLO
+
+try:
+    from roboflow import Roboflow
+except ImportError:
+    Roboflow = None  # type: ignore[assignment]
 
 
 MODEL_DIR = Path("./models")
@@ -38,17 +42,52 @@ PADDLE_ASSETS = {
     "paddle_cls": "https://paddleocr.bj.bcebos.com/dygraph_v2.0/ch/ch_ppocr_mobile_v2.0_cls_infer.tar",
 }
 
+MAX_BACKGROUND_RATIO_PER_SPLIT = 0.35
+
 CLASS_ALIASES = {
-    "motorcycle": {"motorcycle", "bike", "scooter", "motorbike", "two_wheeler", "two-wheeler"},
-    "person": {"person", "rider", "human", "people", "man", "woman"},
-    "helmet": {"helmet", "with_helmet", "helmet_on", "wearing_helmet"},
-    "no_helmet": {"no_helmet", "without_helmet", "nohelmet", "not_wearing_helmet", "helmet_off"},
+    "motorcycle": {
+        "motorcycle",
+        "motor_cycle",
+        "bike",
+        "scooter",
+        "motorbike",
+        "two_wheeler",
+        "two-wheeler",
+        "2_wheeler",
+        "2wheeler",
+    },
+    "person": {
+        "person",
+        "rider",
+        "human",
+        "people",
+        "man",
+        "woman",
+        "driver",
+        "passenger",
+        "pillion",
+        "pillion_rider",
+    },
+    "helmet": {"helmet", "with_helmet", "withhelmet", "helmet_on", "wearing_helmet"},
+    "no_helmet": {
+        "no_helmet",
+        "without_helmet",
+        "withouthelmet",
+        "nohelmet",
+        "not_wearing_helmet",
+        "helmet_off",
+        "unhelmeted",
+        "bare_head",
+    },
     "license_plate": {
         "license_plate",
         "licence_plate",
+        "license",
+        "licence",
         "plate",
         "number_plate",
         "registration_plate",
+        "registration_number",
         "numberplate",
         "licenceplate",
         "licenseplate",
@@ -193,6 +232,25 @@ def map_source_class_to_target_id(name: str) -> Optional[int]:
     for idx, target_name in enumerate(TARGET_CLASSES):
         if normalized in CLASS_ALIASES[target_name]:
             return idx
+
+    tokens = [t for t in normalized.split("_") if t]
+    token_set = set(tokens)
+
+    if any(t in normalized for t in ["plate", "licence", "license", "registration"]):
+        return TARGET_CLASSES.index("license_plate")
+
+    if "helmet" in normalized:
+        negative_tokens = {"no", "without", "non", "off", "unhelmeted", "bare"}
+        if token_set.intersection(negative_tokens) or "nohelmet" in normalized or "withouthelmet" in normalized:
+            return TARGET_CLASSES.index("no_helmet")
+        return TARGET_CLASSES.index("helmet")
+
+    if token_set.intersection({"person", "rider", "human", "man", "woman", "driver", "passenger", "pillion"}):
+        return TARGET_CLASSES.index("person")
+
+    if token_set.intersection({"motorcycle", "motor", "bike", "motorbike", "scooter", "two", "wheeler"}):
+        return TARGET_CLASSES.index("motorcycle")
+
     return None
 
 
@@ -206,34 +264,190 @@ def parse_names_from_data_yaml(data_yaml_path: Path) -> Dict[int, str]:
     return {}
 
 
-def remap_label_file(source_label: Path, destination_label: Path, source_names: Dict[int, str]) -> None:
+def sanitize_yolo_bbox(xc: float, yc: float, bw: float, bh: float) -> Optional[Tuple[float, float, float, float]]:
+    eps = 1e-6
+    if bw <= 0.0 or bh <= 0.0:
+        return None
+
+    x1 = xc - (bw / 2.0)
+    y1 = yc - (bh / 2.0)
+    x2 = xc + (bw / 2.0)
+    y2 = yc + (bh / 2.0)
+
+    x1 = min(1.0 - eps, max(0.0, x1))
+    y1 = min(1.0 - eps, max(0.0, y1))
+    x2 = min(1.0, max(x1 + eps, x2))
+    y2 = min(1.0, max(y1 + eps, y2))
+
+    return (
+        min(1.0, max(0.0, (x1 + x2) / 2.0)),
+        min(1.0, max(0.0, (y1 + y2) / 2.0)),
+        min(1.0, max(eps, x2 - x1)),
+        min(1.0, max(eps, y2 - y1)),
+    )
+
+
+def remap_label_file(source_label: Path, destination_label: Path, source_names: Dict[int, str]) -> List[int]:
     ensure_dir(destination_label.parent)
     if not source_label.exists():
         destination_label.write_text("", encoding="utf-8")
-        return
+        return []
 
     out_lines: List[str] = []
+    mapped_classes: List[int] = []
     for raw in source_label.read_text(encoding="utf-8").splitlines():
         parts = raw.strip().split()
         if len(parts) != 5:
             continue
         try:
             src_cls = int(float(parts[0]))
+            xc, yc, bw, bh = [float(v) for v in parts[1:]]
         except ValueError:
             continue
         mapped = map_source_class_to_target_id(source_names.get(src_cls, ""))
         if mapped is None:
             continue
-        out_lines.append(f"{mapped} {' '.join(parts[1:])}")
+
+        sanitized = sanitize_yolo_bbox(xc, yc, bw, bh)
+        if sanitized is None:
+            continue
+
+        sxc, syc, sbw, sbh = sanitized
+        out_lines.append(f"{mapped} {sxc:.6f} {syc:.6f} {sbw:.6f} {sbh:.6f}")
+        mapped_classes.append(mapped)
 
     destination_label.write_text("\n".join(out_lines), encoding="utf-8")
+    return mapped_classes
 
 
 def split_candidates() -> Dict[str, List[str]]:
     return {"train": ["train"], "val": ["valid", "val"], "test": ["test"]}
 
 
+def collect_split_statistics(merged_root: Path, split: str) -> Dict[str, Any]:
+    image_suffixes = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+    images_dir = merged_root / split / "images"
+    labels_dir = merged_root / split / "labels"
+    class_counts = [0 for _ in TARGET_CLASSES]
+    labeled_images = 0
+    background_images = 0
+
+    if not images_dir.exists():
+        return {
+            "images": 0,
+            "labeled_images": 0,
+            "background_images": 0,
+            "class_counts": class_counts,
+            "boxes": 0,
+        }
+
+    for image_path in images_dir.iterdir():
+        if image_path.suffix.lower() not in image_suffixes:
+            continue
+        label_path = labels_dir / f"{image_path.stem}.txt"
+        valid_line_count = 0
+        if label_path.exists():
+            for raw in label_path.read_text(encoding="utf-8").splitlines():
+                parts = raw.strip().split()
+                if len(parts) != 5:
+                    continue
+                try:
+                    cls_id = int(float(parts[0]))
+                except ValueError:
+                    continue
+                if 0 <= cls_id < len(class_counts):
+                    class_counts[cls_id] += 1
+                    valid_line_count += 1
+        if valid_line_count > 0:
+            labeled_images += 1
+        else:
+            background_images += 1
+
+    return {
+        "images": labeled_images + background_images,
+        "labeled_images": labeled_images,
+        "background_images": background_images,
+        "class_counts": class_counts,
+        "boxes": sum(class_counts),
+    }
+
+
+def trim_background_images(merged_root: Path, split: str, max_background_ratio: float) -> None:
+    image_suffixes = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+    images_dir = merged_root / split / "images"
+    labels_dir = merged_root / split / "labels"
+    if not images_dir.exists():
+        return
+
+    background_images: List[Path] = []
+    positive_count = 0
+    for image_path in sorted(images_dir.iterdir()):
+        if image_path.suffix.lower() not in image_suffixes:
+            continue
+        label_path = labels_dir / f"{image_path.stem}.txt"
+        is_positive = False
+        if label_path.exists():
+            for raw in label_path.read_text(encoding="utf-8").splitlines():
+                parts = raw.strip().split()
+                if len(parts) == 5:
+                    is_positive = True
+                    break
+        if is_positive:
+            positive_count += 1
+        else:
+            background_images.append(image_path)
+
+    allowed_background = int(round(positive_count * max_background_ratio))
+    excess = max(0, len(background_images) - allowed_background)
+    if excess == 0:
+        return
+
+    for image_path in background_images[-excess:]:
+        label_path = labels_dir / f"{image_path.stem}.txt"
+        image_path.unlink(missing_ok=True)
+        label_path.unlink(missing_ok=True)
+
+    print(
+        f"[INFO] Trimmed {excess} background-only images from split '{split}' "
+        f"(kept {allowed_background}, positive={positive_count})."
+    )
+
+
+def print_dataset_statistics(merged_root: Path) -> Dict[str, Dict[str, Any]]:
+    all_stats: Dict[str, Dict[str, Any]] = {}
+    print("\n[INFO] Merged dataset statistics")
+    for split in ["train", "val", "test"]:
+        stats = collect_split_statistics(merged_root, split)
+        all_stats[split] = stats
+        class_repr = {TARGET_CLASSES[i]: stats["class_counts"][i] for i in range(len(TARGET_CLASSES))}
+        print(
+            f" - {split}: images={stats['images']}, labeled={stats['labeled_images']}, "
+            f"background={stats['background_images']}, boxes={stats['boxes']}, classes={class_repr}"
+        )
+    print("")
+    return all_stats
+
+
+def validate_split_coverage(all_stats: Dict[str, Dict[str, Any]]) -> None:
+    train_counts = all_stats["train"]["class_counts"]
+    missing_train = [TARGET_CLASSES[i] for i, c in enumerate(train_counts) if c <= 0]
+    if missing_train:
+        raise RuntimeError(
+            "Merged train split is missing target classes: "
+            f"{missing_train}. Fix class mapping/datasets before training."
+        )
+
+    for split in ["val", "test"]:
+        counts = all_stats[split]["class_counts"]
+        missing = [TARGET_CLASSES[i] for i, c in enumerate(counts) if c <= 0]
+        if missing:
+            print(f"[WARN] Split '{split}' is missing classes: {missing}")
+
+
 def merge_datasets(downloaded_roots: List[Path], merged_root: Path) -> Path:
+    if merged_root.exists():
+        shutil.rmtree(merged_root, ignore_errors=True)
+
     for split in ["train", "val", "test"]:
         ensure_dir(merged_root / split / "images")
         ensure_dir(merged_root / split / "labels")
@@ -267,6 +481,9 @@ def merge_datasets(downloaded_roots: List[Path], merged_root: Path) -> Path:
                 shutil.copy2(image_path, dest_image)
                 remap_label_file(src_label, dest_label, source_names)
 
+    for split in ["train", "val", "test"]:
+        trim_background_images(merged_root, split, max_background_ratio=MAX_BACKGROUND_RATIO_PER_SPLIT)
+
     merged_yaml = merged_root / "data.yaml"
     merged_yaml.write_text(
         yaml.safe_dump(
@@ -281,6 +498,10 @@ def merge_datasets(downloaded_roots: List[Path], merged_root: Path) -> Path:
         ),
         encoding="utf-8",
     )
+
+    stats = print_dataset_statistics(merged_root)
+    validate_split_coverage(stats)
+
     return merged_yaml
 
 
@@ -447,6 +668,12 @@ def _attempt_download(version_obj: Any, local_dir: Path) -> Optional[Path]:
 
 
 def download_roboflow_datasets(api_key: str, output_raw_dir: Path) -> List[Path]:
+    if Roboflow is None:
+        raise ImportError(
+            "roboflow package is required to download datasets. "
+            "Install with: pip install -r requirements_download.txt"
+        )
+
     rf = Roboflow(api_key=api_key)
     ensure_dir(output_raw_dir)
     workspace_hints = get_accessible_workspaces(api_key)

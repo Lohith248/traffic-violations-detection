@@ -3,10 +3,8 @@ from __future__ import annotations
 import argparse
 import shutil
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 
-import albumentations as A
-import cv2
 import yaml
 from ultralytics import YOLO
 
@@ -44,25 +42,32 @@ def sanitize_yolo_bbox(xc: float, yc: float, bw: float, bh: float) -> List[float
     ]
 
 
-def build_indian_road_augmenter() -> A.Compose:
+def build_indian_road_augmenter() -> Any:
     """
     Albumentations config tuned for Indian road conditions:
     rain, fog, motion blur, brightness variance, and compression artifacts.
     """
+    try:
+        import albumentations as A  # local import to keep non-augmentation training lightweight
+        import inspect
+    except ImportError as exc:
+        raise ImportError(
+            "Albumentations is required for --augment-offline. "
+            "Install training dependencies with: pip install -r requirements.txt"
+        ) from exc
+
+    image_compression_params = inspect.signature(A.ImageCompression.__init__).parameters
+    if "quality_range" in image_compression_params:
+        image_compression = A.ImageCompression(quality_range=(35, 95), p=0.40)
+    else:
+        image_compression = A.ImageCompression(quality_lower=35, quality_upper=95, p=0.40)
+
     return A.Compose(
         [
             A.OneOf(
                 [
-                    A.RandomRain(
-                        slant_lower=-15,
-                        slant_upper=15,
-                        drop_length=16,
-                        drop_width=1,
-                        blur_value=3,
-                        brightness_coefficient=0.9,
-                        p=1.0,
-                    ),
-                    A.RandomFog(fog_coef_lower=0.1, fog_coef_upper=0.35, alpha_coef=0.08, p=1.0),
+                    A.RandomRain(p=1.0),
+                    A.RandomFog(p=1.0),
                 ],
                 p=0.45,
             ),
@@ -72,7 +77,7 @@ def build_indian_road_augmenter() -> A.Compose:
                 contrast_limit=0.25,
                 p=0.50,
             ),
-            A.ImageCompression(quality_lower=35, quality_upper=95, p=0.40),
+            image_compression,
         ],
         bbox_params=A.BboxParams(
             format="yolo",
@@ -154,6 +159,72 @@ def resolve_split_paths(dataset_root: Path, split_images_rel: str) -> Tuple[Path
     images_dir = dataset_root / Path(split_images_rel)
     labels_dir = images_dir.parent / "labels"
     return images_dir, labels_dir
+
+
+def summarize_split_counts(images_dir: Path, labels_dir: Path, num_classes: int) -> Dict[str, List[int] | int]:
+    class_counts = [0 for _ in range(num_classes)]
+    labeled_images = 0
+    background_images = 0
+
+    for image_path in list_image_files(images_dir):
+        label_path = labels_dir / f"{image_path.stem}.txt"
+        class_ids, _ = read_yolo_labels(label_path, num_classes=num_classes)
+        if class_ids:
+            labeled_images += 1
+            for cls in class_ids:
+                class_counts[cls] += 1
+        else:
+            background_images += 1
+
+    return {
+        "class_counts": class_counts,
+        "labeled_images": labeled_images,
+        "background_images": background_images,
+        "images": labeled_images + background_images,
+    }
+
+
+def audit_dataset_coverage(data_yaml_path: Path) -> None:
+    cfg = load_data_yaml(data_yaml_path)
+    names = cfg["names"]
+    if isinstance(names, dict):
+        num_classes = len(names.keys())
+        class_names = [str(names[i]) for i in sorted(names.keys())]
+    else:
+        num_classes = len(names)
+        class_names = [str(x) for x in names]
+
+    dataset_root = Path(cfg.get("path", data_yaml_path.parent)).resolve()
+    split_map = {
+        "train": cfg["train"],
+        "val": cfg["val"],
+        "test": cfg.get("test", cfg["val"]),
+    }
+
+    print("\n[INFO] Dataset coverage audit")
+    split_stats: Dict[str, Dict[str, List[int] | int]] = {}
+    for split, rel in split_map.items():
+        images_dir, labels_dir = resolve_split_paths(dataset_root, rel)
+        stats = summarize_split_counts(images_dir, labels_dir, num_classes=num_classes)
+        split_stats[split] = stats
+        class_repr = {class_names[i]: stats["class_counts"][i] for i in range(num_classes)}
+        print(
+            f" - {split}: images={stats['images']}, labeled={stats['labeled_images']}, "
+            f"background={stats['background_images']}, classes={class_repr}"
+        )
+    print("")
+
+    missing_train = [class_names[i] for i, c in enumerate(split_stats["train"]["class_counts"]) if c <= 0]
+    if missing_train:
+        raise ValueError(
+            f"Train split is missing classes {missing_train}. "
+            "Fix dataset merge/remap before training."
+        )
+
+    for split in ["val", "test"]:
+        missing = [class_names[i] for i, c in enumerate(split_stats[split]["class_counts"]) if c <= 0]
+        if missing:
+            print(f"[WARN] {split} split missing classes: {missing}")
 
 
 def collect_class_counts(
@@ -254,6 +325,14 @@ def prepare_augmented_dataset(
     - train split: original + augmented copies
     - val/test splits: copied as-is
     """
+    try:
+        import cv2  # local import to avoid requiring cv2 when augmentation is disabled
+    except ImportError as exc:
+        raise ImportError(
+            "OpenCV (cv2) is required for --augment-offline. "
+            "Install training dependencies with: pip install -r requirements.txt"
+        ) from exc
+
     cfg = load_data_yaml(source_data_yaml)
     names = cfg["names"]
     if isinstance(names, dict):
@@ -467,6 +546,8 @@ def main() -> None:
             copies_per_image=max(1, args.aug_copies_per_image),
         )
         print(f"[INFO] Using augmented dataset: {data_yaml}")
+
+    audit_dataset_coverage(data_yaml)
 
     output_weights = train_model(
         merged_data_yaml=data_yaml,

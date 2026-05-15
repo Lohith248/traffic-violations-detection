@@ -1,83 +1,79 @@
-# Traffic Violation Detection Submission (AID 728)
+# Traffic Violation Detection (SSH GPU Workflow)
 
-## Directory structure (required)
+This repo is now configured for **SSH GPU training first** (no Colab required).
+
+## 1) Required folder layout
 
 ```text
-.
+traffic-violations-detection/
 ├─ solution.py
 ├─ train.py
 ├─ test_single.py
 ├─ download_models.py
-├─ requirements.txt
+├─ requirements.txt              # training environment
+├─ requirements_download.txt     # dataset/model download helper deps
+├─ requirements_inference.txt    # inference/evaluator environment
 ├─ README.md
 ├─ datasets/
-│  ├─ raw/                 # auto-created by download_models.py
+│  ├─ raw/                       # auto-created by download_models.py
 │  └─ merged/
-│     └─ data.yaml         # merged YOLO dataset for training
+│     ├─ data.yaml
+│     ├─ train/images, train/labels
+│     ├─ val/images, val/labels
+│     └─ test/images, test/labels
 └─ models/
    ├─ yolov8s.pt
-   ├─ yolov8s_traffic.pt   # produced by train.py
+   ├─ yolov8m.pt                 # auto-downloaded when needed
+   ├─ yolov8s_traffic.pt
+   ├─ yolov8m_traffic.pt
    ├─ paddle_det/
-   │  ├─ inference.pdmodel
-   │  └─ inference.pdiparams
    ├─ paddle_rec/
-   │  ├─ inference.pdmodel
-   │  └─ inference.pdiparams
    └─ paddle_cls/
-      ├─ inference.pdmodel
-      └─ inference.pdiparams
 ```
 
-## One-time setup (models + datasets)
+## 2) Create clean SSH env (Python 3.10 recommended)
 
-Set Roboflow API key, then run once:
+```bash
+conda create -n tvd310 python=3.10 -y
+conda activate tvd310
+python -m pip install --upgrade pip setuptools wheel
+```
 
-```powershell
-$env:ROBOFLOW_API_KEY="YOUR_API_KEY"
+## 3) Install training dependencies (conflict-free)
+
+```bash
+pip install -r requirements.txt
+```
+
+Use this for **training only**.
+
+## 4) Download/merge datasets and base models (one-time)
+
+Install downloader deps (separate on purpose):
+
+```bash
+pip install -r requirements_download.txt
+```
+
+Set key and run:
+
+```bash
+export ROBOFLOW_API_KEY="YOUR_API_KEY"
 python download_models.py
 ```
 
-`download_models.py` will:
-1. Download `yolov8s.pt` into `./models/`.
-2. Download PaddleOCR det/rec/cls into `./models/paddle_det`, `./models/paddle_rec`, `./models/paddle_cls`.
-3. Download and merge the required Roboflow datasets into `./datasets/merged/data.yaml`.
-4. Print model file sizes and total model size.
+`download_models.py` now:
+1. Downloads YOLO base weights and Paddle OCR assets.
+2. Merges Roboflow datasets into 5 target classes.
+3. Sanitizes YOLO boxes.
+4. Trims excessive background-only images.
+5. Prints split-wise class counts.
+6. Fails early if train split misses any target class.
 
-## Train
-
-```bash
-python train.py --data-yaml ./datasets/merged/data.yaml --model-dir ./models --epochs 50 --imgsz 640
-```
-
-Best checkpoint is copied to:
-
-```text
-./models/yolov8s_traffic.pt
-```
-
-## Google Colab training (YOLOv8m)
-
-Use this when you want to clone the repo and train directly in Colab.
+## 5) Train YOLOv8m on SSH GPU
 
 ```bash
-!git clone <YOUR_REPO_URL>
-%cd traffic-violations-detection
-!pip install -U pip
-!pip install ultralytics==8.2.103 albumentations==1.3.1 opencv-python-headless==4.10.0.84 PyYAML==6.0.2 numpy==1.23.5 roboflow==1.1.37
-```
-
-If `./datasets/merged/data.yaml` is not already in your repo, download and merge datasets:
-
-```bash
-import os
-os.environ["ROBOFLOW_API_KEY"] = "YOUR_API_KEY"
-!python download_models.py
-```
-
-Train YOLOv8m:
-
-```bash
-!python train.py \
+python train.py \
   --data-yaml ./datasets/merged/data.yaml \
   --model-dir ./models \
   --base-weights yolov8m.pt \
@@ -91,38 +87,22 @@ Train YOLOv8m:
   --device 0
 ```
 
-`train.py` now auto-downloads missing base weights (`yolov8m.pt`, `yolov8s.pt`) into `./models`.
+Notes:
+- `train.py` auto-downloads missing base weights (`yolov8s.pt` / `yolov8m.pt`) into `./models`.
+- `train.py` audits class coverage before actual training.
 
-## Test single image
-
-```bash
-python test_single.py <image_path> [model_dir]
-```
-
-Example:
+## 6) Quick local test
 
 ```bash
-python test_single.py ./sample.jpg ./models
+python test_single.py /path/to/sample.jpg ./models
 ```
 
-## Evaluator loading behavior
+## 7) Inference/evaluator dependencies (separate env recommended)
 
-The evaluator dynamically imports `TrafficViolationDetector` from `solution.py` and uses:
+If you need to run full OCR inference (`solution.py`) with PaddleOCR:
 
-```python
-model = TrafficViolationDetector("./models")
-output = model.predict(image_path)
+```bash
+pip install -r requirements_inference.txt
 ```
 
-## Model size breakdown (target)
-
-| File/Folder | Size (approx.) |
-|---|---:|
-| `models/yolov8s.pt` | ~21.5 MB |
-| `models/yolov8s_traffic.pt` | ~21.5 MB |
-| `models/paddle_det/` | ~4.7 MB |
-| `models/paddle_rec/` | ~9.8 MB |
-| `models/paddle_cls/` | ~1.4 MB |
-| **Total** | **~58.9 MB** |
-
-Total model size is well under the 250 MB limit. Use the size report printed by `download_models.py` for exact local values.
+This split avoids the resolver conflicts you were hitting during GPU training setup.
