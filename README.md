@@ -55,6 +55,44 @@ Best checkpoint is copied to:
 ./models/yolov8s_traffic.pt
 ```
 
+## Google Colab training (YOLOv8m)
+
+Use this when you want to clone the repo and train directly in Colab.
+
+```bash
+!git clone <YOUR_REPO_URL>
+%cd traffic-violations-detection
+!pip install -U pip
+!pip install ultralytics==8.2.103 albumentations==1.3.1 opencv-python-headless==4.10.0.84 PyYAML==6.0.2 numpy==1.23.5 roboflow==1.1.37
+```
+
+If `./datasets/merged/data.yaml` is not already in your repo, download and merge datasets:
+
+```bash
+import os
+os.environ["ROBOFLOW_API_KEY"] = "YOUR_API_KEY"
+!python download_models.py
+```
+
+Train YOLOv8m:
+
+```bash
+!python train.py \
+  --data-yaml ./datasets/merged/data.yaml \
+  --model-dir ./models \
+  --base-weights yolov8m.pt \
+  --output-weights yolov8m_traffic.pt \
+  --rebalance-train \
+  --max-repeats 3 \
+  --augment-offline \
+  --aug-copies-per-image 1 \
+  --epochs 50 \
+  --imgsz 640 \
+  --device 0
+```
+
+`train.py` now auto-downloads missing base weights (`yolov8m.pt`, `yolov8s.pt`) into `./models`.
+
 ## Test single image
 
 ```bash

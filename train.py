@@ -11,6 +11,39 @@ import yaml
 from ultralytics import YOLO
 
 
+def sanitize_yolo_bbox(xc: float, yc: float, bw: float, bh: float) -> List[float]:
+    """
+    Clamps a YOLO-format bbox to valid [0, 1] bounds and guarantees non-zero size.
+    This prevents tiny negative values from floating-point drift (e.g., x_min=-5e-07).
+    """
+    eps = 1e-6
+
+    xc = float(xc)
+    yc = float(yc)
+    bw = float(bw)
+    bh = float(bh)
+
+    if bw <= 0.0 or bh <= 0.0:
+        return [0.5, 0.5, eps, eps]
+
+    x1 = xc - (bw / 2.0)
+    y1 = yc - (bh / 2.0)
+    x2 = xc + (bw / 2.0)
+    y2 = yc + (bh / 2.0)
+
+    x1 = min(1.0 - eps, max(0.0, x1))
+    y1 = min(1.0 - eps, max(0.0, y1))
+    x2 = min(1.0, max(x1 + eps, x2))
+    y2 = min(1.0, max(y1 + eps, y2))
+
+    return [
+        min(1.0, max(0.0, (x1 + x2) / 2.0)),
+        min(1.0, max(0.0, (y1 + y2) / 2.0)),
+        min(1.0, max(eps, x2 - x1)),
+        min(1.0, max(eps, y2 - y1)),
+    ]
+
+
 def build_indian_road_augmenter() -> A.Compose:
     """
     Albumentations config tuned for Indian road conditions:
@@ -86,10 +119,7 @@ def read_yolo_labels(label_file: Path, num_classes: int) -> Tuple[List[int], Lis
         if bw <= 0.0 or bh <= 0.0:
             continue
 
-        xc = min(1.0, max(0.0, xc))
-        yc = min(1.0, max(0.0, yc))
-        bw = min(1.0, max(1e-6, bw))
-        bh = min(1.0, max(1e-6, bh))
+        xc, yc, bw, bh = sanitize_yolo_bbox(xc, yc, bw, bh)
 
         class_ids.append(cls)
         bboxes.append([xc, yc, bw, bh])
@@ -268,7 +298,8 @@ def prepare_augmented_dataset(
             aug_label_path = out_train_labels / f"{aug_stem}.txt"
 
             cv2.imwrite(str(aug_image_path), aug_image)
-            write_yolo_labels(aug_label_path, list(aug_class_ids), [list(b) for b in aug_boxes])
+            sanitized_aug_boxes = [sanitize_yolo_bbox(*list(b)) for b in aug_boxes]
+            write_yolo_labels(aug_label_path, list(aug_class_ids), sanitized_aug_boxes)
 
     augmented_yaml = output_root / "data.yaml"
     write_data_yaml(
@@ -284,6 +315,32 @@ def prepare_augmented_dataset(
     return augmented_yaml
 
 
+def ensure_base_weights(model_dir: Path, base_weights_name: str) -> Path:
+    """
+    Ensures base weights exist under model_dir.
+    If missing, tries to fetch them through Ultralytics (useful in fresh Colab sessions).
+    """
+    model_dir.mkdir(parents=True, exist_ok=True)
+    base_weights = model_dir / base_weights_name
+    if base_weights.exists():
+        return base_weights
+
+    try:
+        print(f"[INFO] Base weights not found at {base_weights}. Downloading {base_weights_name} via Ultralytics...")
+        model = YOLO(base_weights_name)
+        ckpt_path = Path(str(model.ckpt_path))
+        if not ckpt_path.exists():
+            raise FileNotFoundError(f"Ultralytics checkpoint path does not exist: {ckpt_path}")
+        shutil.copy2(ckpt_path, base_weights)
+        print(f"[OK] Saved base weights to {base_weights}")
+        return base_weights
+    except Exception as exc:
+        raise FileNotFoundError(
+            f"Base weights '{base_weights_name}' are missing and could not be downloaded automatically. "
+            f"Expected path: {base_weights}"
+        ) from exc
+
+
 def train_model(
     merged_data_yaml: Path,
     model_dir: Path,
@@ -294,12 +351,7 @@ def train_model(
     device: str = "0",
 ) -> Path:
     model_dir.mkdir(parents=True, exist_ok=True)
-
-    base_weights = model_dir / base_weights_name
-    if not base_weights.exists():
-        raise FileNotFoundError(
-            f"Base weights not found at {base_weights}. Run download_models.py first."
-        )
+    base_weights = ensure_base_weights(model_dir=model_dir, base_weights_name=base_weights_name)
 
     model = YOLO(str(base_weights))
     model.train(
@@ -325,7 +377,7 @@ def train_model(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train YOLOv8s for traffic violation detection.")
+    parser = argparse.ArgumentParser(description="Train YOLOv8 for traffic violation detection.")
     parser.add_argument(
         "--data-yaml",
         type=str,
@@ -336,7 +388,7 @@ def parse_args() -> argparse.Namespace:
         "--model-dir",
         type=str,
         default="./models",
-        help="Directory that contains yolov8s.pt and where trained weights are saved",
+        help="Directory for base/trained weights (e.g. yolov8s.pt, yolov8m.pt, yolov8m_traffic.pt)",
     )
     parser.add_argument(
         "--base-weights",
