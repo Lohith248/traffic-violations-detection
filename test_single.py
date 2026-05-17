@@ -18,6 +18,12 @@ def main() -> None:
 
         detector = TrafficViolationDetector(model_dir=str(model_dir))
 
+        ypath = getattr(detector, "yolo_checkpoint_path", None)
+        if ypath:
+            print(f"YOLO checkpoint: {ypath}")
+        else:
+            print("YOLO checkpoint: (not loaded)")
+
         start = time.perf_counter()
         result = detector.predict(str(image_path))
         elapsed_ms = (time.perf_counter() - start) * 1000.0

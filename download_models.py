@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
@@ -11,6 +12,12 @@ import urllib.request
 import zipfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 import yaml
 from ultralytics import YOLO
@@ -28,11 +35,27 @@ MERGED_DATASET_DIR = DATASET_ROOT / "merged"
 
 TARGET_CLASSES = ["motorcycle", "person", "helmet", "no_helmet", "license_plate"]
 
+# Roboflow workspace/project slug or slug-only (resolved via API). Order: multi-class helmets/riders first,
+# then plates. Slugs drift on Universe — if download fails, check the project's URL and paste the exact path.
+#
+# Curated selection rationale:
+#  1. abhilash-poojary  — ONLY dataset with all 5 target classes in a single bundle
+#  2. traffic-violation/with-no-helmet — strong motorcycle + no_helmet + plate coverage (~350 imgs)
+#  3. traffic-violation/no-helmet-jkn77 — pure no_helmet boost (~144 imgs)
+#  4. triplerider — motorcycle + helmet/no_helmet in triple-riding scenarios (~582 imgs)
+#  5. nckh-2023/helmet-detection-project — already downloaded, good helmet + person + plate (~1563 imgs)
+#  6. vehicle-registration-plates-trudk — massive clean plate dataset (~8800 imgs)
+#
+# DROPPED:
+#  - ilpd/indian-licence-plate-detection: character-level OCR annotations (A-Z, 0-9), NOT plate bboxes
+#  - bike-helmet-detection-2vdjo: redundant with nckh-2023, download failures
+#  - expertos/helmet-motorcycle-no-helmet-person: noisy "objects" catch-all class
 DATASET_IDENTIFIERS = [
-    "bike-helmet-detection-2vdjo",
-    "helmet-htftb",
+    "abhilash-poojary/person-dataset-5qprs",
+    "traffic-violation/with-no-helmet",
+    "traffic-violation/no-helmet-jkn77",
+    "triplerider/triplerider",
     "nckh-2023/helmet-detection-project",
-    "ilpd/indian-licence-plate-detection/dataset/4",
     "vehicle-registration-plates-trudk",
 ]
 
@@ -51,10 +74,17 @@ CLASS_ALIASES = {
         "bike",
         "scooter",
         "motorbike",
+        "moped",
         "two_wheeler",
         "two-wheeler",
         "2_wheeler",
         "2wheeler",
+        # Traffic/violation dataset spellings (names run through normalize_name → lowercase + underscores).
+        "motor_cycles",
+        "two_wheelers",
+        # Kaggle dataset variations
+        "motorcycle_with_rider",
+        "vehicle",  # hozngvan dataset sometimes labels motorcycle as "vehicle"
     },
     "person": {
         "person",
@@ -67,8 +97,35 @@ CLASS_ALIASES = {
         "passenger",
         "pillion",
         "pillion_rider",
+        # Rider-as-one-box datasets (Roboflow helmet projects often label this vs "motorcycle").
+        "motorcyclist",
+        "motor_cyclist",
+        "motorcycle_rider",
+        "bike_rider",
+        "motor_rider",
+        "biker",
+        # Triple riding / multiple riders (same head as "people on bike" unless you split triple later).
+        "tripling",
+        "triple_riding",
+        "tripleriding",
+        "triple_riders",
+        "triple_rider",
+        # devgurucodes / meliodassourav Kaggle datasets
+        "overloading",  # overloaded bike = multiple persons on motorcycle
+        "overload",
     },
-    "helmet": {"helmet", "with_helmet", "withhelmet", "helmet_on", "wearing_helmet"},
+    "helmet": {
+        "helmet",
+        "with_helmet",
+        "withhelmet",
+        "helmet_on",
+        "wearing_helmet",
+        # CamelCase variants become these after normalization.
+        "helmets",
+        # Kaggle dataset variations
+        "with helmet",
+        "with_helment",  # common typos
+    },
     "no_helmet": {
         "no_helmet",
         "without_helmet",
@@ -78,6 +135,14 @@ CLASS_ALIASES = {
         "helmet_off",
         "unhelmeted",
         "bare_head",
+        "barehead",
+        "no_helm",
+        "nohelm",
+        "no_helment",  # common typo on small datasets
+        # Kaggle dataset variations
+        "without helmet",
+        "without_helment",  # common typo
+        "head",  # some datasets label bare head as "head"
     },
     "license_plate": {
         "license_plate",
@@ -91,6 +156,17 @@ CLASS_ALIASES = {
         "numberplate",
         "licenceplate",
         "licenseplate",
+        # Traffic Violation / Indian plate naming
+        "platenumber",
+        "plate_number",
+        "plateno",
+        "plate_no",
+        "lp",
+        # Kaggle dataset variations
+        "number plate",
+        "indian_licence_plate",
+        "indian_license_plate",
+        "reg_plate",
     },
 }
 
@@ -129,7 +205,7 @@ def format_mb(size_bytes: int) -> str:
 def print_model_sizes(model_dir: Path) -> None:
     print("\n[INFO] Model size report")
     tracked = [
-        model_dir / "yolov8s.pt",
+        model_dir / "yolo26s.pt",
         model_dir / "paddle_det",
         model_dir / "paddle_rec",
         model_dir / "paddle_cls",
@@ -183,15 +259,18 @@ def extract_tar_to_flat_dir(archive_path: Path, output_dir: Path) -> None:
                 shutil.copy2(src, dst)
 
 
-def download_yolov8_base_weights(model_dir: Path) -> Path:
+DEFAULT_YOLO_BASE_WEIGHT = "yolo26s.pt"
+
+
+def download_default_yolo_base_weights(model_dir: Path, hub_name: str = DEFAULT_YOLO_BASE_WEIGHT) -> Path:
     ensure_dir(model_dir)
-    output = model_dir / "yolov8s.pt"
+    output = model_dir / hub_name
     if output.exists():
         print(f"[SKIP] {output} already exists")
         return output
 
-    print("[INFO] Downloading YOLOv8s base weights...")
-    model = YOLO("yolov8s.pt")
+    print(f"[INFO] Downloading YOLO base weights ({hub_name})...")
+    model = YOLO(hub_name)
     cache_path = Path(str(model.ckpt_path))
     if not cache_path.exists():
         raise FileNotFoundError("Ultralytics did not provide a valid checkpoint path.")
@@ -229,9 +308,16 @@ def normalize_name(name: str) -> str:
 
 def map_source_class_to_target_id(name: str) -> Optional[int]:
     normalized = normalize_name(name)
+    # Explicit drops (datasets include catch-all buckets we should not coerce into targets).
+    if normalized in {"objects", "object", "misc", "other"}:
+        return None
     for idx, target_name in enumerate(TARGET_CLASSES):
         if normalized in CLASS_ALIASES[target_name]:
             return idx
+
+    # Partial / compound names (underscore tokenization did not isolate the word).
+    if "motorcyclist" in normalized:
+        return TARGET_CLASSES.index("person")
 
     tokens = [t for t in normalized.split("_") if t]
     token_set = set(tokens)
@@ -428,14 +514,18 @@ def print_dataset_statistics(merged_root: Path) -> Dict[str, Dict[str, Any]]:
     return all_stats
 
 
-def validate_split_coverage(all_stats: Dict[str, Dict[str, Any]]) -> None:
+def validate_split_coverage(all_stats: Dict[str, Dict[str, Any]], *, strict_train: bool = True) -> None:
     train_counts = all_stats["train"]["class_counts"]
     missing_train = [TARGET_CLASSES[i] for i, c in enumerate(train_counts) if c <= 0]
     if missing_train:
-        raise RuntimeError(
+        msg = (
             "Merged train split is missing target classes: "
-            f"{missing_train}. Fix class mapping/datasets before training."
+            f"{missing_train}. Fix class mapping/datasets or pass --allow-incomplete-merge "
+            "(not recommended for final training)."
         )
+        if strict_train:
+            raise RuntimeError(msg)
+        print(f"[WARN] {msg}")
 
     for split in ["val", "test"]:
         counts = all_stats[split]["class_counts"]
@@ -444,65 +534,70 @@ def validate_split_coverage(all_stats: Dict[str, Dict[str, Any]]) -> None:
             print(f"[WARN] Split '{split}' is missing classes: {missing}")
 
 
-def merge_datasets(downloaded_roots: List[Path], merged_root: Path) -> Path:
+def merge_datasets(downloaded_roots: List[Path], merged_root: Path, *, strict_train: bool = True) -> Path:
     if merged_root.exists():
         shutil.rmtree(merged_root, ignore_errors=True)
 
-    for split in ["train", "val", "test"]:
-        ensure_dir(merged_root / split / "images")
-        ensure_dir(merged_root / split / "labels")
+    try:
+        for split in ["train", "val", "test"]:
+            ensure_dir(merged_root / split / "images")
+            ensure_dir(merged_root / split / "labels")
 
-    image_suffixes = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
-    candidates = split_candidates()
+        image_suffixes = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+        candidates = split_candidates()
 
-    for ds_idx, dataset_root in enumerate(downloaded_roots):
-        data_yaml = dataset_root / "data.yaml"
-        if not data_yaml.exists():
-            raise FileNotFoundError(f"Missing data.yaml in dataset: {dataset_root}")
-        source_names = parse_names_from_data_yaml(data_yaml)
+        for ds_idx, dataset_root in enumerate(downloaded_roots):
+            data_yaml = dataset_root / "data.yaml"
+            if not data_yaml.exists():
+                raise FileNotFoundError(f"Missing data.yaml in dataset: {dataset_root}")
+            source_names = parse_names_from_data_yaml(data_yaml)
 
-        for target_split, src_split_candidates in candidates.items():
-            source_split = next((s for s in src_split_candidates if (dataset_root / s / "images").exists()), None)
-            if source_split is None:
-                continue
-
-            src_images = dataset_root / source_split / "images"
-            src_labels = dataset_root / source_split / "labels"
-
-            for image_path in src_images.iterdir():
-                if image_path.suffix.lower() not in image_suffixes:
+            for target_split, src_split_candidates in candidates.items():
+                source_split = next((s for s in src_split_candidates if (dataset_root / s / "images").exists()), None)
+                if source_split is None:
                     continue
 
-                prefix = f"ds{ds_idx}_{dataset_root.name}_{image_path.stem}"
-                dest_image = merged_root / target_split / "images" / f"{prefix}{image_path.suffix.lower()}"
-                dest_label = merged_root / target_split / "labels" / f"{prefix}.txt"
-                src_label = src_labels / f"{image_path.stem}.txt"
+                src_images = dataset_root / source_split / "images"
+                src_labels = dataset_root / source_split / "labels"
 
-                shutil.copy2(image_path, dest_image)
-                remap_label_file(src_label, dest_label, source_names)
+                for image_path in src_images.iterdir():
+                    if image_path.suffix.lower() not in image_suffixes:
+                        continue
 
-    for split in ["train", "val", "test"]:
-        trim_background_images(merged_root, split, max_background_ratio=MAX_BACKGROUND_RATIO_PER_SPLIT)
+                    prefix = f"ds{ds_idx}_{dataset_root.name}_{image_path.stem}"
+                    dest_image = merged_root / target_split / "images" / f"{prefix}{image_path.suffix.lower()}"
+                    dest_label = merged_root / target_split / "labels" / f"{prefix}.txt"
+                    src_label = src_labels / f"{image_path.stem}.txt"
 
-    merged_yaml = merged_root / "data.yaml"
-    merged_yaml.write_text(
-        yaml.safe_dump(
-            {
-                "path": str(merged_root.resolve()),
-                "train": "train/images",
-                "val": "val/images",
-                "test": "test/images",
-                "names": TARGET_CLASSES,
-            },
-            sort_keys=False,
-        ),
-        encoding="utf-8",
-    )
+                    shutil.copy2(image_path, dest_image)
+                    remap_label_file(src_label, dest_label, source_names)
 
-    stats = print_dataset_statistics(merged_root)
-    validate_split_coverage(stats)
+        for split in ["train", "val", "test"]:
+            trim_background_images(merged_root, split, max_background_ratio=MAX_BACKGROUND_RATIO_PER_SPLIT)
 
-    return merged_yaml
+        stats = print_dataset_statistics(merged_root)
+        validate_split_coverage(stats, strict_train=strict_train)
+
+        merged_yaml = merged_root / "data.yaml"
+        merged_yaml.write_text(
+            yaml.safe_dump(
+                {
+                    "path": str(merged_root.resolve()),
+                    "train": "train/images",
+                    "val": "val/images",
+                    "test": "test/images",
+                    "names": TARGET_CLASSES,
+                },
+                sort_keys=False,
+            ),
+            encoding="utf-8",
+        )
+
+        return merged_yaml
+    except BaseException:
+        shutil.rmtree(merged_root, ignore_errors=True)
+        raise
+
 
 
 def api_get_json(url: str) -> Dict[str, Any]:
@@ -627,47 +722,57 @@ def get_latest_version_number(project_obj: Any) -> int:
 
 def _attempt_download(version_obj: Any, local_dir: Path) -> Optional[Path]:
     """
-    Attempts to download a Roboflow dataset version in YOLOv8 format.
-    Returns the dataset path on success, or None if the export doesn't exist
-    on Roboflow's cloud storage (NoSuchKey / BadZipFile).
-    Raises for all other unexpected errors.
+    Download a Roboflow dataset version as YOLO (v8 then v5 fallback).
+    Many projects lack a working yolov8 cloud export or pin an old ultralytics;
+    yolov5 exports still unpack to the same layout for merge.
     """
-    # Clean up any prior incomplete attempt for this exact version dir
-    shutil.rmtree(local_dir, ignore_errors=True)
+    last_exc: Optional[Exception] = None
 
-    try:
-        dataset = version_obj.download("yolov8", location=str(local_dir), overwrite=True)
-        # Verify a data.yaml was actually produced
-        result_path = Path(dataset.location)
-        if not (result_path / "data.yaml").exists():
-            shutil.rmtree(local_dir, ignore_errors=True)
-            return None
-        return result_path
-    except (zipfile.BadZipFile, Exception) as e:
-        # Peek at the "zip" to detect a NoSuchKey cloud error
-        no_such_key = False
-        zip_path = local_dir / "roboflow.zip"
-        if zip_path.exists():
-            try:
-                with zip_path.open("rb") as f:
-                    chunk = f.read(500)
-                decoded = chunk.decode("utf-8", errors="ignore")
-                if "NoSuchKey" in decoded or "does not exist" in decoded.lower():
-                    no_such_key = True
-            except Exception:
-                pass
-
+    for fmt in ("yolov8", "yolov5"):
         shutil.rmtree(local_dir, ignore_errors=True)
 
-        if no_such_key:
-            # Caller will try the next version
-            return None
+        try:
+            dataset = version_obj.download(fmt, location=str(local_dir), overwrite=True)
+            result_path = Path(dataset.location)
+            if (result_path / "data.yaml").exists():
+                print(f"[INFO] Downloaded as Roboflow format={fmt!r} -> {result_path}")
+                return result_path
+            shutil.rmtree(local_dir, ignore_errors=True)
+            print(f"[WARN] {fmt} download completed but data.yaml is missing; trying next format...")
+        except Exception as e:
+            last_exc = e
+            no_such_key = False
+            zip_path = local_dir / "roboflow.zip"
+            if zip_path.exists():
+                try:
+                    with zip_path.open("rb") as f:
+                        chunk = f.read(500)
+                    decoded = chunk.decode("utf-8", errors="ignore")
+                    if "NoSuchKey" in decoded or "does not exist" in decoded.lower():
+                        no_such_key = True
+                except Exception:
+                    pass
 
-        # Re-raise genuine errors (auth, network, etc.)
-        raise
+            shutil.rmtree(local_dir, ignore_errors=True)
+
+            if fmt == "yolov8":
+                detail = "export missing" if no_such_key else str(e).split("\n")[0][:120]
+                print(f"[WARN] yolov8 download failed ({detail}); trying yolov5...")
+                continue
+
+            if no_such_key:
+                return None
+            if last_exc is not None:
+                raise last_exc
+
+    return None
 
 
-def download_roboflow_datasets(api_key: str, output_raw_dir: Path) -> List[Path]:
+def download_roboflow_datasets(
+    api_key: str,
+    output_raw_dir: Path,
+    dataset_identifiers: Optional[List[str]] = None,
+) -> List[Path]:
     if Roboflow is None:
         raise ImportError(
             "roboflow package is required to download datasets. "
@@ -680,7 +785,8 @@ def download_roboflow_datasets(api_key: str, output_raw_dir: Path) -> List[Path]
     downloaded_roots: List[Path] = []
     skipped: List[str] = []
 
-    for dataset_id in DATASET_IDENTIFIERS:
+    ids = dataset_identifiers if dataset_identifiers is not None else list(DATASET_IDENTIFIERS)
+    for dataset_id in ids:
         workspace, project, explicit_version = parse_dataset_identifier(dataset_id, api_key, workspace_hints)
         project_obj = rf.workspace(workspace).project(project)
 
@@ -721,7 +827,7 @@ def download_roboflow_datasets(api_key: str, output_raw_dir: Path) -> List[Path]
                 dataset_root = result
                 break
             else:
-                print(f"[WARN] v{version} of {dataset_id} has no YOLOv8 export — trying older version...")
+                print(f"[WARN] v{version} of {dataset_id} has no usable YOLO export — trying older version...")
 
         if dataset_root is not None:
             downloaded_roots.append(dataset_root)
@@ -738,21 +844,103 @@ def download_roboflow_datasets(api_key: str, output_raw_dir: Path) -> List[Path]
     return downloaded_roots
 
 
+def discover_existing_raw_roots(raw_dir: Path) -> List[Path]:
+    """Subfolders under raw_dir that contain a YOLO data.yaml."""
+    if not raw_dir.is_dir():
+        return []
+    return sorted(p for p in raw_dir.iterdir() if p.is_dir() and (p / "data.yaml").is_file())
+
+
+def merged_dataset_identifier_list(cli_extra: str = "") -> List[str]:
+    """DATASET_IDENTIFIERS plus optional comma-separated slug list (CLI/env)."""
+    ids = list(DATASET_IDENTIFIERS)
+    extra = (cli_extra or "").strip()
+    if not extra:
+        extra = os.getenv("ROBOFLOW_EXTRA_DATASETS", "").strip()
+    if extra:
+        ids.extend(part.strip() for part in extra.split(",") if part.strip())
+    return ids
+
+
+def parse_dm_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Download Paddle + YOLO base weights + Roboflow dumps, merge into datasets/merged."
+    )
+    p.add_argument(
+        "--merge-only",
+        action="store_true",
+        help="Skip downloads; rebuild datasets/merged from existing datasets/raw/*/data.yaml only",
+    )
+    p.add_argument(
+        "--allow-incomplete-merge",
+        action="store_true",
+        help="Warn instead of failing when merged train lacks any of the 5 target classes",
+    )
+    p.add_argument(
+        "--extra-datasets",
+        type=str,
+        default="",
+        help=(
+            "Comma-separated Roboflow dataset slugs; appended after built-in DATASET_IDENTIFIERS. "
+            "When empty, ROBOFLOW_EXTRA_DATASETS env is used if set."
+        ),
+    )
+    p.add_argument(
+        "--no-paddle",
+        action="store_true",
+        help="Skip PaddleOCR model download (datasets still merged if downloaded)",
+    )
+    p.add_argument(
+        "--no-yolov8-base",
+        action="store_true",
+        help="Skip copying default yolo26s.pt into models/",
+    )
+    return p.parse_args(argv)
+
+
 def main() -> None:
+    args = parse_dm_args()
+    strict_train = not args.allow_incomplete_merge
+
+    if args.merge_only:
+        roots = discover_existing_raw_roots(RAW_DATASET_DIR)
+        if not roots:
+            raise RuntimeError(
+                f"No YOLO dataset roots found under {RAW_DATASET_DIR} (each subfolder needs data.yaml). "
+                "Run a full download first or copy Roboflow exports there."
+            )
+        print(f"[STEP] Merge-only: rebuilding {MERGED_DATASET_DIR} from {len(roots)} raw dataset(s)...")
+        merge_datasets(roots, MERGED_DATASET_DIR, strict_train=strict_train)
+        print(f"[OK] Merged YAML: {MERGED_DATASET_DIR / 'data.yaml'}")
+        return
+
     api_key = os.getenv("ROBOFLOW_API_KEY", "").strip()
     verify_roboflow_api_key(api_key)
 
-    print("[STEP] Downloading YOLOv8s base weights...")
-    download_yolov8_base_weights(MODEL_DIR)
+    if not args.no_yolov8_base:
+        print("[STEP] Downloading default YOLO26s base weights into models/ …")
+        download_default_yolo_base_weights(MODEL_DIR)
 
-    print("[STEP] Downloading PaddleOCR det/rec/cls models...")
-    download_paddle_models(MODEL_DIR)
+    if not args.no_paddle:
+        print("[STEP] Downloading PaddleOCR det/rec/cls models...")
+        download_paddle_models(MODEL_DIR)
+
+    identifiers = merged_dataset_identifier_list(args.extra_datasets)
 
     print("[STEP] Downloading Roboflow datasets...")
-    roots = download_roboflow_datasets(api_key=api_key, output_raw_dir=RAW_DATASET_DIR)
+    roots = download_roboflow_datasets(api_key=api_key, output_raw_dir=RAW_DATASET_DIR, dataset_identifiers=identifiers)
+
+    # Also include any Kaggle-converted datasets (from convert_kaggle_to_yolo.py)
+    kaggle_roots = [
+        p for p in discover_existing_raw_roots(RAW_DATASET_DIR)
+        if p not in roots and "kaggle" in p.name.lower()
+    ]
+    if kaggle_roots:
+        print(f"[INFO] Also including {len(kaggle_roots)} Kaggle dataset(s): {[r.name for r in kaggle_roots]}")
+        roots.extend(kaggle_roots)
 
     print("[STEP] Merging datasets into 5 target classes...")
-    merged_yaml = merge_datasets(roots, MERGED_DATASET_DIR)
+    merged_yaml = merge_datasets(roots, MERGED_DATASET_DIR, strict_train=strict_train)
     print(f"[OK] Merged dataset YAML: {merged_yaml}")
 
     print_model_sizes(MODEL_DIR)

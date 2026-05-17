@@ -184,7 +184,7 @@ def summarize_split_counts(images_dir: Path, labels_dir: Path, num_classes: int)
     }
 
 
-def audit_dataset_coverage(data_yaml_path: Path) -> None:
+def audit_dataset_coverage(data_yaml_path: Path, *, on_missing_train: str = "error") -> None:
     cfg = load_data_yaml(data_yaml_path)
     names = cfg["names"]
     if isinstance(names, dict):
@@ -216,10 +216,15 @@ def audit_dataset_coverage(data_yaml_path: Path) -> None:
 
     missing_train = [class_names[i] for i, c in enumerate(split_stats["train"]["class_counts"]) if c <= 0]
     if missing_train:
-        raise ValueError(
+        msg = (
             f"Train split is missing classes {missing_train}. "
-            "Fix dataset merge/remap before training."
+            "Fix dataset merge/remap unless you deliberately use --audit-missing train=warn."
         )
+        mode = on_missing_train if on_missing_train in {"error", "warn", "ignore"} else "error"
+        if mode == "error":
+            raise ValueError(msg)
+        if mode == "warn":
+            print(f"[WARN] {msg}")
 
     for split in ["val", "test"]:
         missing = [class_names[i] for i, c in enumerate(split_stats[split]["class_counts"]) if c <= 0]
@@ -423,28 +428,35 @@ def ensure_base_weights(model_dir: Path, base_weights_name: str) -> Path:
 def train_model(
     merged_data_yaml: Path,
     model_dir: Path,
-    base_weights_name: str = "yolov8s.pt",
-    output_weights_name: str = "yolov8s_traffic.pt",
+    base_weights_name: str = "yolo26s.pt",
+    output_weights_name: str = "yolo26s_traffic.pt",
     epochs: int = 50,
     imgsz: int = 640,
     device: str = "0",
+    ultralytics_extra: Dict[str, Any] | None = None,
 ) -> Path:
     model_dir.mkdir(parents=True, exist_ok=True)
     base_weights = ensure_base_weights(model_dir=model_dir, base_weights_name=base_weights_name)
 
     model = YOLO(str(base_weights))
-    model.train(
-        data=str(merged_data_yaml),
-        epochs=epochs,
-        imgsz=imgsz,
-        project=str(model_dir / "runs"),
-        name="traffic_violation",
-        exist_ok=True,
-        pretrained=True,
-        deterministic=True,
-        seed=42,
-        device=device,
-    )
+    kw: Dict[str, Any] = {
+        "data": str(merged_data_yaml),
+        "epochs": epochs,
+        "imgsz": imgsz,
+        "project": str(model_dir / "runs"),
+        "name": "traffic_violation",
+        "exist_ok": True,
+        "pretrained": True,
+        "deterministic": True,
+        "seed": 42,
+        "device": device,
+    }
+    if ultralytics_extra:
+        overlap = kw.keys() & ultralytics_extra.keys()
+        if overlap:
+            raise ValueError(f"Internal kw overlap with ultralytics-extra: {sorted(overlap)}")
+        kw.update(ultralytics_extra)
+    model.train(**kw)
 
     best_path = Path(str(model.trainer.best))
     if not best_path.exists():
@@ -456,7 +468,20 @@ def train_model(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train YOLOv8 for traffic violation detection.")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Train Ultralytics YOLO26 on the merged 5-class traffic dataset (defaults: YOLO26s). "
+            "Optional heavier backup: yolo26m.pt. If hub issues occur, fall back to yolo11s.pt."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Typical two-checkpoint flow — evaluate both on domain val, keep the better weights:\n"
+            "  python train.py --base-weights yolo26s.pt --output-weights yolo26s_traffic.pt\n"
+            "  python train.py --base-weights yolo26m.pt  --output-weights yolo26m_traffic.pt\n\n"
+            "Fallback (older Ultralytics / hub): --base-weights yolo11s.pt\n\n"
+            "Requires a recent ultralytics that ships YOLO26 hub weights (see requirements.txt)."
+        ),
+    )
     parser.add_argument(
         "--data-yaml",
         type=str,
@@ -467,19 +492,19 @@ def parse_args() -> argparse.Namespace:
         "--model-dir",
         type=str,
         default="./models",
-        help="Directory for base/trained weights (e.g. yolov8s.pt, yolov8m.pt, yolov8m_traffic.pt)",
+        help="Directory for base and trained .pt weights (e.g. yolo26s.pt, yolo26m_traffic.pt)",
     )
     parser.add_argument(
         "--base-weights",
         type=str,
-        default="yolov8s.pt",
-        help="Base Ultralytics weights file name inside model-dir (e.g. yolov8s.pt, yolov8m.pt)",
+        default="yolo26s.pt",
+        help="Base checkpoint inside model-dir (default YOLO26s; use yolo26m.pt for more capacity; yolo11s.pt if hub issues)",
     )
     parser.add_argument(
         "--output-weights",
         type=str,
-        default="yolov8s_traffic.pt",
-        help="Output trained weights file name inside model-dir",
+        default="yolo26s_traffic.pt",
+        help="Filename for the copied best.pt in model-dir after training",
     )
     parser.add_argument(
         "--device",
@@ -488,7 +513,41 @@ def parse_args() -> argparse.Namespace:
         help="Training device for Ultralytics (e.g. 0 for first GPU, cpu for CPU)",
     )
     parser.add_argument("--epochs", type=int, default=50, help="Number of training epochs")
-    parser.add_argument("--imgsz", type=int, default=640, help="Training image size")
+    parser.add_argument("--imgsz", type=int, default=640, help="Training image size (try 960–1280 for small plates)")
+    parser.add_argument("--batch", type=int, default=None, help="If set: YOLO batch size (lower when imgsz is large)")
+    parser.add_argument("--patience", type=int, default=None, help="Early-stop patience epochs (YOLO default if omitted)")
+    parser.add_argument("--workers", type=int, default=None, help="Dataloader worker processes (omit for Ultralytics default)")
+    parser.add_argument(
+        "--box-loss",
+        type=float,
+        default=None,
+        dest="loss_box",
+        help="Ultralytics box loss gain (higher emphasizes tighter bbox regression)",
+    )
+    parser.add_argument(
+        "--cls-loss",
+        type=float,
+        default=None,
+        dest="loss_cls",
+        help="Ultralytics cls loss gain (higher emphasizes classification helmet vs plate vs …)",
+    )
+    parser.add_argument(
+        "--cos-lr",
+        action="store_true",
+        help="Use cosine LR schedule (Ultralytics)",
+    )
+    parser.add_argument(
+        "--no-amp",
+        action="store_true",
+        help="Disable AMP mixed precision training",
+    )
+    parser.add_argument(
+        "--audit-missing-train",
+        type=str,
+        choices=("error", "warn", "ignore"),
+        default="error",
+        help="Strictness when declared classes have zero boxes in train split",
+    )
     parser.add_argument(
         "--rebalance-train",
         action="store_true",
@@ -523,6 +582,12 @@ def parse_args() -> argparse.Namespace:
         default="./datasets/merged_augmented",
         help="Output directory for offline-augmented dataset",
     )
+    parser.add_argument(
+        "--export-h",
+        type=str,
+        default="",
+        help="After training, copy merged output weights here as well (e.g. ./actual_weights/best.pt)",
+    )
     return parser.parse_args()
 
 
@@ -547,7 +612,23 @@ def main() -> None:
         )
         print(f"[INFO] Using augmented dataset: {data_yaml}")
 
-    audit_dataset_coverage(data_yaml)
+    audit_dataset_coverage(data_yaml, on_missing_train=args.audit_missing_train)
+
+    xt: Dict[str, Any] = {}
+    if args.batch is not None:
+        xt["batch"] = int(args.batch)
+    if args.patience is not None:
+        xt["patience"] = int(args.patience)
+    if args.workers is not None:
+        xt["workers"] = int(args.workers)
+    if args.loss_box is not None:
+        xt["box"] = float(args.loss_box)
+    if args.loss_cls is not None:
+        xt["cls"] = float(args.loss_cls)
+    if args.cos_lr:
+        xt["cos_lr"] = True
+    if args.no_amp:
+        xt["amp"] = False
 
     output_weights = train_model(
         merged_data_yaml=data_yaml,
@@ -557,8 +638,16 @@ def main() -> None:
         epochs=args.epochs,
         imgsz=args.imgsz,
         device=args.device,
+        ultralytics_extra=xt or None,
     )
     print(f"[DONE] Best model saved to: {output_weights}")
+
+    export_h = getattr(args, "export_h", "") or ""
+    if export_h.strip():
+        h_dst = Path(export_h.strip()).expanduser().resolve()
+        h_dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(output_weights, h_dst)
+        print(f"[DONE] Exported copy -> {h_dst}")
 
 
 if __name__ == "__main__":

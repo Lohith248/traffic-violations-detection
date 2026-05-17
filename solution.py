@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 import time
 from dataclasses import dataclass
@@ -8,11 +9,20 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
-from paddleocr import PaddleOCR
 from ultralytics import YOLO
+
+from paddleocr import PaddleOCR
 
 
 Box = Tuple[float, float, float, float]
+
+_STANDARD_TASK_ORDER = (
+    "motorcycle",
+    "person",
+    "helmet",
+    "no_helmet",
+    "license_plate",
+)
 
 
 @dataclass
@@ -29,7 +39,15 @@ class TrafficViolationDetector:
         Initialize and load all models.
 
         Args:
-            model_dir: Directory that contains YOLO and PaddleOCR model assets.
+            model_dir: PaddleOCR model assets directory (submission layout stays ./models/...).
+
+        YOLO weights resolution (first hit wins):
+          - TRAFFIC_YOLO_WEIGHTS or YOLO_WEIGHTS env var
+          - ./actual_weights/best.pt (or last.pt)
+          - ./models/yolo26s_traffic.pt / yolo26m_traffic.pt (fine-tuned YOLO26)
+          - ./models/yolo11s_traffic.pt / yolo11m_traffic.pt (fallback)
+          - ./models/yolov8s_traffic.pt / yolov8m_traffic.pt (legacy)
+          - ./h/*.pt and ./models/yolo26*.pt / yolo11*.pt / yolov8*.pt
         """
         try:
             self.model_dir = Path(model_dir)
@@ -42,20 +60,128 @@ class TrafficViolationDetector:
             self.ocr_soft_budget_ms = 4300.0
             self.min_plate_overlap_ratio = 0.05
 
+            self.yolo_checkpoint_path: Optional[str] = None
             self.yolo_model: Optional[YOLO] = None
             self.ocr_model: Optional[PaddleOCR] = None
+            self._class_id_to_bucket: Dict[int, Optional[str]] = {}
 
             self._load_models()
         except Exception:
             self.yolo_model = None
             self.ocr_model = None
+            self.yolo_checkpoint_path = None
+
+    @staticmethod
+    def _solution_root() -> Path:
+        return Path(__file__).resolve().parent
+
+    def _resolve_yolo_weights(self) -> Path:
+        env = (os.environ.get("TRAFFIC_YOLO_WEIGHTS") or os.environ.get("YOLO_WEIGHTS") or "").strip()
+        if env:
+            p = Path(os.path.expandvars(os.path.expanduser(env))).resolve()
+            if p.is_file():
+                return p
+
+        root = self._solution_root()
+        ordered = [
+            root / "actual_weights" / "best.pt",
+            root / "actual_weights" / "last.pt",
+            self.model_dir / "yolo26s_traffic.pt",
+            self.model_dir / "yolo26m_traffic.pt",
+            self.model_dir / "yolo11s_traffic.pt",
+            self.model_dir / "yolo11m_traffic.pt",
+            self.model_dir / "yolov8s_traffic.pt",
+            self.model_dir / "yolov8m_traffic.pt",
+            root / "h" / "yolo26s.pt",
+            root / "h" / "yolo26m.pt",
+            self.model_dir / "yolo26s.pt",
+            self.model_dir / "yolo26m.pt",
+            root / "h" / "yolo11s.pt",
+            root / "h" / "yolo11m.pt",
+            self.model_dir / "yolo11s.pt",
+            self.model_dir / "yolo11m.pt",
+            root / "h" / "yolov8s.pt",
+            root / "h" / "yolov8m.pt",
+            self.model_dir / "yolov8s.pt",
+            self.model_dir / "yolov8m.pt",
+        ]
+        for cand in ordered:
+            if cand.is_file():
+                return cand.resolve()
+        raise FileNotFoundError(
+            "No YOLO weights found. Put best.pt in ./actual_weights/ or set TRAFFIC_YOLO_WEIGHTS, "
+            "or use ./models/yolo26s_traffic.pt / export_weights.py after training."
+        )
+
+    def _normalize_label_tokens(self, raw: str) -> str:
+        return raw.strip().lower().replace("-", "_").replace(" ", "_")
+
+    def _bucket_for_label_text(self, raw: str) -> Optional[str]:
+        n = self._normalize_label_tokens(raw)
+        tokens = frozenset(t for t in n.split("_") if t)
+
+        if n == "bicycle":
+            return None
+
+        if n in {"motorcycle", "motorbike", "scooter"}:
+            return "motorcycle"
+
+        person_tokens = {"person", "rider", "pillion", "human", "man", "woman", "people", "driver", "passenger"}
+        if n == "person" or tokens & person_tokens:
+            if "traffic" in tokens:
+                return None
+            return "person"
+
+        negative_helmet = {"no", "without", "non", "off", "bare"}
+        has_helmet_word = "helmet" in n
+        if has_helmet_word and tokens & negative_helmet:
+            return "no_helmet"
+        if has_helmet_word and tokens & {"plate", "licence", "license"}:
+            return None
+        if has_helmet_word:
+            return "helmet"
+
+        plate_tokens = {"plate", "licence", "license", "registration", "numberplate"}
+        if tokens & plate_tokens or any(k in n for k in ["licenceplate", "licenseplate", "number_plate"]):
+            return "license_plate"
+
+        return None
+
+    def _refresh_class_buckets(self) -> None:
+        self._class_id_to_bucket = {}
+        if self.yolo_model is None:
+            return
+        try:
+            names = getattr(self.yolo_model, "names", {})
+            ordered: Dict[int, str] = {}
+            if isinstance(names, dict):
+                for k, v in names.items():
+                    ordered[int(k)] = str(v)
+            elif isinstance(names, (list, tuple)):
+                ordered = {i: str(label) for i, label in enumerate(names)}
+
+            seq = tuple(_STANDARD_TASK_ORDER)
+            normalized_seq_match = False
+            if len(ordered) == len(seq):
+                normalized_seq_match = tuple(
+                    self._normalize_label_tokens(ordered[i]) for i in range(len(seq))
+                ) == seq
+
+            for class_id in sorted(ordered.keys()):
+                label = ordered[class_id]
+                bucket = self._bucket_for_label_text(label)
+                if bucket is None and normalized_seq_match:
+                    bucket = seq[class_id] if 0 <= class_id < len(seq) else None
+                self._class_id_to_bucket[class_id] = bucket
+        except Exception:
+            self._class_id_to_bucket = {}
 
     def _load_models(self) -> None:
         try:
-            yolo_weights = self.model_dir / "yolov8s_traffic.pt"
-            if not yolo_weights.exists():
-                raise FileNotFoundError(f"Missing YOLO weights: {yolo_weights}")
+            yolo_weights = self._resolve_yolo_weights()
+            self.yolo_checkpoint_path = str(yolo_weights.resolve())
             self.yolo_model = YOLO(str(yolo_weights))
+            self._refresh_class_buckets()
 
             det_candidates = [
                 self.model_dir / "paddle_det",
@@ -69,6 +195,26 @@ class TrafficViolationDetector:
                 self.model_dir / "paddle_cls",
                 self.model_dir / "paddleocr" / "cls" / "ch_ppocr_mobile_v2.0_cls_infer",
             ]
+
+            root_dir = self._solution_root()
+            det_candidates.extend(
+                [
+                    root_dir / "paddle_det",
+                    root_dir / "paddleocr" / "det" / "ch_PP-OCRv4_det_infer",
+                ]
+            )
+            rec_candidates.extend(
+                [
+                    root_dir / "paddle_rec",
+                    root_dir / "paddleocr" / "rec" / "en_PP-OCRv4_rec_infer",
+                ]
+            )
+            cls_candidates.extend(
+                [
+                    root_dir / "paddle_cls",
+                    root_dir / "paddleocr" / "cls" / "ch_ppocr_mobile_v2.0_cls_infer",
+                ]
+            )
 
             det_dir = next((p for p in det_candidates if self._is_valid_paddle_dir(p)), None)
             rec_dir = next((p for p in rec_candidates if self._is_valid_paddle_dir(p)), None)
@@ -89,6 +235,7 @@ class TrafficViolationDetector:
         except Exception:
             self.yolo_model = None
             self.ocr_model = None
+            self.yolo_checkpoint_path = None
 
     def _is_valid_paddle_dir(self, directory: Path) -> bool:
         try:
@@ -201,8 +348,11 @@ class TrafficViolationDetector:
             if self.yolo_model is None:
                 return grouped
 
+            rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            # YOLO26 is NMS-free end-to-end; Ultralytics still returns results[0].boxes the same way.
+            # The iou= argument may be ignored for YOLO26 but is kept for YOLO11/YOLOv8 checkpoints.
             results = self.yolo_model.predict(
-                source=image,
+                source=rgb,
                 conf=self.detector_conf_threshold,
                 iou=self.detector_iou_threshold,
                 imgsz=640,
@@ -259,18 +409,10 @@ class TrafficViolationDetector:
 
     def _map_model_class_to_target(self, class_id: int, class_name: str) -> Optional[str]:
         try:
-            normalized = class_name.replace("-", "_").replace(" ", "_")
-            if normalized in {"motorcycle", "person", "helmet", "no_helmet", "license_plate"}:
-                return normalized
-
-            id_map = {
-                0: "motorcycle",
-                1: "person",
-                2: "helmet",
-                3: "no_helmet",
-                4: "license_plate",
-            }
-            return id_map.get(class_id)
+            bucket = self._class_id_to_bucket.get(class_id)
+            if bucket is not None:
+                return bucket
+            return self._bucket_for_label_text(class_name)
         except Exception:
             return None
 
@@ -284,6 +426,15 @@ class TrafficViolationDetector:
         except Exception:
             return []
 
+    def _has_box_centroid_in_head_region(self, rider_box: Box, boxes: List[Detection]) -> bool:
+        px1, py1, px2, py2 = rider_box
+        top_y = py1 + self.head_region_ratio * max(0.0, (py2 - py1))
+        for item in boxes:
+            cx, cy = self._centroid(item.box)
+            if px1 <= cx <= px2 and py1 <= cy <= top_y:
+                return True
+        return False
+
     def _count_helmet_violations(self, riders: List[Detection], helmets: List[Detection]) -> int:
         try:
             violations = 0
@@ -296,13 +447,7 @@ class TrafficViolationDetector:
 
     def _has_helmet_in_head_region(self, rider_box: Box, helmets: List[Detection]) -> bool:
         try:
-            px1, py1, px2, py2 = rider_box
-            top_y = py1 + self.head_region_ratio * max(0.0, (py2 - py1))
-            for helmet in helmets:
-                cx, cy = self._centroid(helmet.box)
-                if px1 <= cx <= px2 and py1 <= cy <= top_y:
-                    return True
-            return False
+            return self._has_box_centroid_in_head_region(rider_box, helmets)
         except Exception:
             return False
 

@@ -11,18 +11,26 @@ env/
 # Local logs / temp
 *.log
 torch_install.log
+comparison*.json
 
 # Training and generated artifacts
 runs/
 datasets/
 models/
+actual_weights.zip
 
 # OS / editor
 .DS_Store
 Thumbs.db
 .vscode/
+.env
 
 # Local helper scripts / docs not needed in submission
 setup_git*
 git_setup.bat
 *.pdf
+
+# Base model weights (downloaded automatically, do not commit)
+yolo11s.pt
+yolo26s.pt
+yolov8s.pt
