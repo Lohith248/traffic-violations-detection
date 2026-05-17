@@ -1,133 +1,101 @@
-# Traffic Violation Detection (SSH GPU Workflow)
+# Traffic Rule Violation Detection
 
-This repo is configured for **SSH GPU training first** (no Colab required).
+**Team 7** — AID 728 Course Project  
+Ravi Abhinav (BT2024239) · Pranav (BT2024221) · Lohith (BT2024248)
 
-## 1) Required folder layout
+An automated computer vision system that detects motorcycle traffic violations (helmet non-compliance and triple riding) from street scene images and extracts the license plate of offending vehicles via OCR.
 
-```text
-traffic-violations-detection/
-├─ solution.py
-├─ train.py
-├─ export_weights.py
-├─ compare_yolo_checkpoints.py
-├─ evaluate_merged_dataset.py     # domain mAP on datasets/merged val (+ test)
-├─ run_inference_cases.py          # optional web-download smoke tests
-├─ test_single.py
-├─ download_models.py
-├─ requirements.txt / requirements_download.txt / requirements_inference.txt
-├─ README.md
-├─ actual_weights/              # primary: best.pt + last.pt from your training run
-├─ h/                           # optional older mirrors
-├─ datasets/
-│  └─ merged/ …
-└─ models/                      # Paddle + optional yolov8*_traffic.pt copies
+## System Overview
+
+The pipeline uses a **two-stage architecture**:
+
+1. **YOLO26s** — Detects motorcycles, persons, helmets, no-helmets, and license plates (NMS-free, 19.4 MB, ~133ms on CPU).
+2. **PaddleOCR v4** — Extracts license plate text from violating vehicles with dynamic preprocessing and time-capped execution.
+
+**Key Results:** Overall **mAP50 = 0.916** on the test split, with inference under 1 second per image on CPU.
+
+## Submission Structure
+
+```
+<ROLL_NUMBER>/
+├── solution.py             # Main class: TrafficViolationDetector
+├── models/                 # Model weights (≤ 250 MB total)
+│   ├── yolo26s_traffic.pt  # Fine-tuned YOLO26s (5 classes, 19.4 MB)
+│   ├── paddle_det/         # PaddleOCR text detection model
+│   ├── paddle_rec/         # PaddleOCR text recognition model
+│   └── paddle_cls/         # PaddleOCR angle classification model
+├── requirements.txt        # All Python dependencies
+└── README.md               # This file
 ```
 
-## 2) Create clean SSH env (Python 3.10 recommended)
+## Quick Start
 
-```bash
-conda create -n tvd310 python=3.10 -y
-conda activate tvd310
-python -m pip install --upgrade pip setuptools wheel
-```
-
-## 3) Install training dependencies
-
+### 1. Install Dependencies
 ```bash
 pip install -r requirements.txt
 ```
 
-## 4) Download/merge datasets and base models (one-time)
+### 2. Run Inference
+```python
+from solution import TrafficViolationDetector
 
-```bash
-pip install -r requirements_download.txt
-export ROBOFLOW_API_KEY="YOUR_API_KEY"
-python download_models.py
+detector = TrafficViolationDetector(model_dir="./models")
+result = detector.predict("path/to/street_image.jpg")
+print(result)
 ```
 
-## 5) Train and publish weights
-
-Copy your remote `best.pt` / `last.pt` into **`./actual_weights/`** (flat: `actual_weights/best.pt`, not a nested `actual_weights/actual_weights/` folder).
-
-Optional copy into `models/` for course submission bundles:
-
-```bash
-python export_weights.py ./actual_weights/best.pt \
-  --to-models ./models/yolov8s_traffic.pt \
-  --strict
+### 3. Output Format
+```json
+{
+  "violations": [
+    {
+      "num_riders": 3,
+      "helmet_violations": 2,
+      "license_plate": "KA01AB1234"
+    }
+  ]
+}
 ```
+- `num_riders`: Total riders detected on the motorcycle.
+- `helmet_violations`: Number of riders without helmets.
+- `license_plate`: OCR-extracted plate text (empty string if unreadable).
+- Only violating vehicles are reported. Compliant vehicles return an empty list.
 
-Training on the GPU machine:
+## How It Works
 
-```bash
-python train.py \
-  --data-yaml ./datasets/merged/data.yaml \
-  --model-dir ./models \
-  --base-weights yolov8s.pt \
-  --output-weights yolov8s_traffic.pt \
-  --export-h ./actual_weights/best.pt \
-  ...
-```
+1. **Detection:** YOLO26s localizes all motorcycles, persons, helmets, and license plates.
+2. **Rider Association:** Persons are linked to motorcycles via IoU overlap (threshold ≥ 0.15).
+3. **Helmet Check:** The top 35% of each rider's bounding box is checked for a helmet centroid.
+4. **Violation Flagging:** A motorcycle is flagged if `helmet_violations > 0` OR `num_riders > 2`.
+5. **OCR:** PaddleOCR extracts the plate text with up to 4 attempts, soft-capped at 4.3 seconds.
 
-## 6) Quick local test
+## Model Performance (Test Split)
 
-**YOLO load order:** `TRAFFIC_YOLO_WEIGHTS` → `./actual_weights/best.pt` → `./actual_weights/last.pt` → `./models/*_traffic.pt` → `./h/*.pt` → `./models/yolov8*.pt`.
+| Class         | AP50  | AP50-95 |
+|---------------|-------|---------|
+| motorcycle    | 0.924 | 0.648   |
+| person        | 0.968 | 0.815   |
+| helmet        | 0.908 | 0.577   |
+| no_helmet     | 0.836 | 0.494   |
+| license_plate | 0.946 | 0.678   |
+| **Overall**   | **0.916** | **0.643** |
 
-```bash
-python test_single.py /path/to/sample.jpg ./models
-```
+## Constraints Compliance
 
-The script prints which **YOLO checkpoint** file was loaded.
+| Constraint            | Limit      | Actual     |
+|-----------------------|------------|------------|
+| Total model size      | ≤ 250 MB   | ~65 MB ✅  |
+| Large models (>1B)    | Prohibited | Not used ✅|
+| Internet access       | Disabled   | Offline ✅ |
+| Inference time        | ~5 seconds | ~750ms ✅  |
 
-```bash
-python compare_yolo_checkpoints.py
-```
+## Dataset
 
-## 6b) Domain evaluation (merged **val** / **test**)
+Trained on 4,291 images aggregated from 11 sources (Roboflow + Kaggle), unified into 5 classes with 80+ alias mappings resolved programmatically.
 
-**One command (downloads dataset if missing; needs API key unless you skip):**
+## Tech Stack
 
-```bash
-python setup_and_eval.py
-```
-
-Windows PowerShell first: `$env:ROBOFLOW_API_KEY='…'`. Already have **`datasets/merged`**? `python setup_and_eval.py --skip-download`.
-
-Use **`datasets/merged`** from `download_models.py` (or copy from your SSH GPU machine)—not random web images—for real mAP.
-
-```bash
-pip install -r requirements_inference.txt
-python evaluate_merged_dataset.py \
-  --weights ./actual_weights/best.pt \
-  --data-yaml ./datasets/merged/data.yaml \
-  --split val \
-  --split test \
-  --json-out domain_val_report.json
-```
-
-If `data.yaml` contains a `test:` split, you can omit all `--split` flags and the script runs **val** then **test**. Use `--device 0` on GPU or `--batch 4` / `--device cpu` on a laptop.
-
-Equivalent checkpoint timing + val:
-
-```bash
-python compare_yolo_checkpoints.py \
-  --weights ./actual_weights/best.pt \
-  --data-yaml ./datasets/merged/data.yaml
-```
-
-## 7) Inference / OCR environment
-
-```bash
-pip install -r requirements_inference.txt
-```
-
-## FAQ
-
-**Wrong class count (80 vs 5)?**  
-The `.pt` file on disk must be your **fine-tuned** run. COCO base weights always show **nc=80**. Fine-tuned traffic weights show **5 classes** in this order: `motorcycle`, `person`, `helmet`, `no_helmet`, `license_plate`.
-
-Verify:
-
-```bash
-python export_weights.py ./actual_weights/best.pt --strict
-```
+- Python 3.10+, PyTorch, CUDA
+- Ultralytics 8.4.51 (YOLO26s)
+- PaddleOCR v4
+- OpenCV, Albumentations, NumPy

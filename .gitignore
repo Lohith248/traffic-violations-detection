@@ -17,7 +17,19 @@ comparison*.json
 runs/
 datasets/
 models/
+actual_weights/
 actual_weights.zip
+
+# Model weight files (too large for GitHub — use Google Drive link)
+*.pt
+best_main.pt/
+yolo11s_traffic.pt/
+yolo26s_traffic.pt/
+yolo26m_traffic.pt/
+
+# Test data (too large)
+Testset/
+Testset.zip
 
 # OS / editor
 .DS_Store
@@ -25,12 +37,8 @@ Thumbs.db
 .vscode/
 .env
 
-# Local helper scripts / docs not needed in submission
+# Local helper scripts / docs
 setup_git*
 git_setup.bat
 *.pdf
-
-# Base model weights (downloaded automatically, do not commit)
-yolo11s.pt
-yolo26s.pt
-yolov8s.pt
+*.zip

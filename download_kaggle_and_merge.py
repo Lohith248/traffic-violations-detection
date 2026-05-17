@@ -21,12 +21,9 @@ except ImportError:
 KAGGLE_DATASETS = [
     ("aneesarom/rider-with-helmet-without-helmet-number-plate", "datasets/raw/kaggle_aneesarom"),
     ("rishabhzen/on-vehicle-helmet-detection", "datasets/raw/kaggle_rishabhzen"),
-    ("devgurucodes/trafffic-violations-triple-riding-no-helmet-plate", "datasets/raw/kaggle_devgurucodes"),
     ("meliodassourav/traffic-violation-dataset-v3", "datasets/raw/kaggle_meliodassourav"),
-    ("hozngvan/helmet-detection", "datasets/raw/kaggle_hozngvan"),
     ("kedarsai/indian-license-plates-with-labels", "datasets/raw/kaggle_kedarsai"),
     ("guisahanes/traffic-violation-detection-dataset", "datasets/raw/kaggle_guisahanes"),
-    ("andrewmvd/helmet-detection", "datasets/raw/kaggle_andrewmvd"),
 ]
 
 def run(cmd, check=True):
@@ -51,7 +48,7 @@ def main():
         # Roboflow
         if not args.skip_roboflow and args.roboflow_key:
             os.environ["ROBOFLOW_API_KEY"] = args.roboflow_key
-            run(f"{sys.executable} download_models.py --no-paddle --no-yolov8-base")
+            run(f"{sys.executable} download_models.py --no-paddle --no-yolov8-base", check=False)
 
         # Kaggle K1-K8
         if not args.skip_kaggle and args.kaggle_username and args.kaggle_key:

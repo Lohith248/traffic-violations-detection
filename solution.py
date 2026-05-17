@@ -33,6 +33,16 @@ class Detection:
     class_name: str
 
 
+# =============================================================================
+# TrafficViolationDetector — Main submission class (AID 728, Team 7)
+#
+# Two-stage pipeline:
+#   Stage 1: YOLO26s detects 5 classes (motorcycle, person, helmet,
+#            no_helmet, license_plate) from a single RGB image.
+#   Stage 2: Spatial heuristics associate riders to motorcycles,
+#            check helmet compliance, and invoke PaddleOCR on plates
+#            of violating vehicles only.
+# =============================================================================
 class TrafficViolationDetector:
     def __init__(self, model_dir: str = "./models") -> None:
         """
@@ -247,6 +257,7 @@ class TrafficViolationDetector:
         except Exception:
             return False
 
+    # ── PUBLIC API: Stateless single-image inference ──────────────────────
     def predict(self, image_path: str) -> dict:
         """
         Run stateless single-image inference and return only violating motorcycles.
@@ -290,11 +301,13 @@ class TrafficViolationDetector:
             violations: List[dict] = []
             ocr_attempts = 0
 
+            # --- Core violation logic: per-motorcycle assessment ---
             for motorcycle in motorcycles:
                 riders = self._get_riders_for_motorcycle(motorcycle, persons)
                 num_riders = len(riders)
                 helmet_violations = self._count_helmet_violations(riders, helmets)
 
+                # Only report violating vehicles; skip compliant ones
                 if not ((num_riders > 2) or (helmet_violations > 0)):
                     continue
 
@@ -416,6 +429,7 @@ class TrafficViolationDetector:
         except Exception:
             return None
 
+    # ── SPATIAL HEURISTICS: Rider-to-motorcycle assignment via IoU ─────
     def _get_riders_for_motorcycle(self, motorcycle: Detection, persons: List[Detection]) -> List[Detection]:
         try:
             riders: List[Detection] = []
@@ -435,6 +449,7 @@ class TrafficViolationDetector:
                 return True
         return False
 
+    # ── HELMET CHECK: Top 35% of rider bbox checked for helmet centroid ─
     def _count_helmet_violations(self, riders: List[Detection], helmets: List[Detection]) -> int:
         try:
             violations = 0
@@ -473,6 +488,7 @@ class TrafficViolationDetector:
         except Exception:
             return None
 
+    # ── OCR PIPELINE: Multi-attempt PaddleOCR with preprocessing ────────
     def _read_plate_text(
         self, image: np.ndarray, plate_box: Box, remaining_attempts: int
     ) -> Tuple[str, int]:

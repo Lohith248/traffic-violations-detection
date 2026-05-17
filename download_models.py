@@ -54,7 +54,6 @@ DATASET_IDENTIFIERS = [
     "abhilash-poojary/person-dataset-5qprs",
     "traffic-violation/with-no-helmet",
     "traffic-violation/no-helmet-jkn77",
-    "triplerider/triplerider",
     "nckh-2023/helmet-detection-project",
     "vehicle-registration-plates-trudk",
 ]
@@ -787,8 +786,13 @@ def download_roboflow_datasets(
 
     ids = dataset_identifiers if dataset_identifiers is not None else list(DATASET_IDENTIFIERS)
     for dataset_id in ids:
-        workspace, project, explicit_version = parse_dataset_identifier(dataset_id, api_key, workspace_hints)
-        project_obj = rf.workspace(workspace).project(project)
+        try:
+            workspace, project, explicit_version = parse_dataset_identifier(dataset_id, api_key, workspace_hints)
+            project_obj = rf.workspace(workspace).project(project)
+        except Exception as exc:
+            print(f"[WARN] Failed to resolve {dataset_id}: {exc} — skipping.")
+            skipped.append(dataset_id)
+            continue
 
         # Build the list of versions to try
         if explicit_version is not None:
