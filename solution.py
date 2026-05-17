@@ -53,11 +53,9 @@ class TrafficViolationDetector:
 
         YOLO weights resolution (first hit wins):
           - TRAFFIC_YOLO_WEIGHTS or YOLO_WEIGHTS env var
-          - ./actual_weights/best.pt (or last.pt)
-          - ./models/yolo26s_traffic.pt / yolo26m_traffic.pt (fine-tuned YOLO26)
-          - ./models/yolo11s_traffic.pt / yolo11m_traffic.pt (fallback)
-          - ./models/yolov8s_traffic.pt / yolov8m_traffic.pt (legacy)
-          - ./h/*.pt and ./models/yolo26*.pt / yolo11*.pt / yolov8*.pt
+          - ./models/yolo26s_traffic.pt  (primary — fine-tuned YOLO26s, mAP50=0.916)
+          - ./models/yolo11s_traffic.pt  (ablation baseline — fine-tuned YOLO11s)
+          - ./actual_weights/best.pt     (legacy fallback)
         """
         try:
             self.model_dir = Path(model_dir)
@@ -94,26 +92,13 @@ class TrafficViolationDetector:
 
         root = self._solution_root()
         ordered = [
+            # Primary: fine-tuned YOLO26s (best model — mAP50=0.916)
+            self.model_dir / "yolo26s_traffic.pt",
+            # Ablation baseline: fine-tuned YOLO11s
+            self.model_dir / "yolo11s_traffic.pt",
+            # Legacy fallbacks
             root / "actual_weights" / "best.pt",
             root / "actual_weights" / "last.pt",
-            self.model_dir / "yolo26s_traffic.pt",
-            self.model_dir / "yolo26m_traffic.pt",
-            self.model_dir / "yolo11s_traffic.pt",
-            self.model_dir / "yolo11m_traffic.pt",
-            self.model_dir / "yolov8s_traffic.pt",
-            self.model_dir / "yolov8m_traffic.pt",
-            root / "h" / "yolo26s.pt",
-            root / "h" / "yolo26m.pt",
-            self.model_dir / "yolo26s.pt",
-            self.model_dir / "yolo26m.pt",
-            root / "h" / "yolo11s.pt",
-            root / "h" / "yolo11m.pt",
-            self.model_dir / "yolo11s.pt",
-            self.model_dir / "yolo11m.pt",
-            root / "h" / "yolov8s.pt",
-            root / "h" / "yolov8m.pt",
-            self.model_dir / "yolov8s.pt",
-            self.model_dir / "yolov8m.pt",
         ]
         for cand in ordered:
             if cand.is_file():
