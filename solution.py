@@ -666,3 +666,4 @@ class TrafficViolationDetector:
             return float(inter / union)
         except Exception:
             return 0.0
+
