@@ -4,3 +4,4 @@ ultralytics==8.4.51
 roboflow==1.1.37
 python-dotenv
 # Optional — COCO motorcycle+person YOLO export: pip install fiftyone
+

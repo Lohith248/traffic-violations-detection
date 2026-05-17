@@ -788,7 +788,12 @@ def download_roboflow_datasets(
     ids = dataset_identifiers if dataset_identifiers is not None else list(DATASET_IDENTIFIERS)
     for dataset_id in ids:
         workspace, project, explicit_version = parse_dataset_identifier(dataset_id, api_key, workspace_hints)
-        project_obj = rf.workspace(workspace).project(project)
+        try:
+            project_obj = rf.workspace(workspace).project(project)
+        except Exception as e:
+            print(f"[WARN] Failed to load project {workspace}/{project} ({dataset_id}): {e}")
+            skipped.append(dataset_id)
+            continue
 
         # Build the list of versions to try
         if explicit_version is not None:
@@ -949,3 +954,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
