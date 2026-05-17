@@ -23,7 +23,7 @@ KAGGLE_DATASETS = [
     ("rishabhzen/on-vehicle-helmet-detection", "datasets/raw/kaggle_rishabhzen"),
     ("devgurucodes/trafffic-violations-triple-riding-no-helmet-plate", "datasets/raw/kaggle_devgurucodes"),
     ("meliodassourav/traffic-violation-dataset-v3", "datasets/raw/kaggle_meliodassourav"),
-    ("hozngvan/helmet-detection", "datasets/raw/kaggle_hozngvan"),
+
     ("kedarsai/indian-license-plates-with-labels", "datasets/raw/kaggle_kedarsai"),
     ("guisahanes/traffic-violation-detection-dataset", "datasets/raw/kaggle_guisahanes"),
     ("andrewmvd/helmet-detection", "datasets/raw/kaggle_andrewmvd"),
